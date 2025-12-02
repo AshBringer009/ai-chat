@@ -166,6 +166,34 @@ def get_characters_keyboard():
         [InlineKeyboardButton(text="Ева 18+ (NSFW)", callback_data="char_2")],
     ])
 
+def get_response_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🔄 Реролл", callback_data="reroll"),
+            InlineKeyboardButton(text="🖼️ Генерация сцены", callback_data="scene_gen"),
+        ]
+    ])
+
+async def assemble_messages(user_id: int, character_prompt: str | None, user_gender: str, new_user_text: str | None = None, trim_last_assistant: bool = False, fallback_user_text: str | None = None):
+    """Формируем сообщения для модели с учетом системы, пола и истории."""
+    history = await llm_service.get_chat_history(user_id, limit=10)
+    if trim_last_assistant and history and history[-1]["role"] == "assistant":
+        history = history[:-1]
+    if fallback_user_text and (not history or history[-1]["role"] != "user"):
+        history.append({"role": "user", "content": fallback_user_text})
+    if new_user_text:
+        history.append({"role": "user", "content": new_user_text})
+
+    messages_for_model = []
+    if character_prompt:
+        messages_for_model.append({"role": "system", "content": character_prompt})
+    if user_gender == "male":
+        messages_for_model.append({"role": "system", "content": "Обращайся к пользователю в мужском роде и как к мужчине."})
+    elif user_gender == "female":
+        messages_for_model.append({"role": "system", "content": "Обращайся к пользователю в женском роде и как к девушке/женщине."})
+    messages_for_model.extend(history)
+    return messages_for_model
+
 # Выбор персонажа из меню
 @dp.callback_query(F.data == "change_character")
 async def change_character(callback: types.CallbackQuery):
@@ -340,6 +368,130 @@ async def select_character(callback: types.CallbackQuery):
     conn.close()
     await callback.answer()
 
+@dp.callback_query(F.data == "scene_gen")
+async def scene_generation_placeholder(callback: types.CallbackQuery):
+    """Заглушка для будущей генерации картинок/сцен."""
+    await callback.answer()
+    await callback.message.answer("🖼️ Генерация сцены появится позже. Пока это заглушка.")
+
+@dp.callback_query(F.data == "reroll")
+async def reroll_answer(callback: types.CallbackQuery):
+    """Перегенерация последнего ответа модели."""
+    await callback.answer("Перегенерирую ответ...")
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    c.execute("SELECT id, current_model, gender FROM users WHERE telegram_id = ?", (callback.from_user.id,))
+    user = c.fetchone()
+    if not user:
+        conn.close()
+        await callback.message.answer("Не найден пользователь. Отправьте сообщение, чтобы начать диалог.")
+        return
+
+    user_id = user[0]
+    current_model = user[1] if len(user) > 1 else "char_1"
+    user_gender = user[2] if len(user) > 2 else "unknown"
+
+    char_id = None
+    if isinstance(current_model, str) and current_model.startswith("char_"):
+        try:
+            char_id = int(current_model.split("_")[1])
+        except (IndexError, ValueError):
+            char_id = None
+
+    if not char_id:
+        char_id = 1
+        c.execute(
+            "UPDATE users SET current_model = ? WHERE id = ?",
+            (f"char_{char_id}", user_id)
+        )
+        conn.commit()
+
+    c.execute("SELECT system_prompt FROM characters WHERE id = ?", (char_id,))
+    row = c.fetchone()
+    character_prompt = row[0] if row else None
+
+    c.execute("SELECT content FROM messages WHERE user_id = ? AND role = 'user' ORDER BY timestamp DESC LIMIT 1", (user_id,))
+    last_user_row = c.fetchone()
+    if not last_user_row:
+        conn.close()
+        await callback.message.answer("Не нашлось последнего запроса для реролла. Напишите новое сообщение.")
+        return
+    last_user_text = last_user_row[0] or ""
+
+    messages_for_model = await assemble_messages(
+        user_id=user_id,
+        character_prompt=character_prompt,
+        user_gender=user_gender,
+        trim_last_assistant=True,
+        fallback_user_text=last_user_text
+    )
+
+    typing_stop = asyncio.Event()
+
+    async def periodic_typing():
+        while not typing_stop.is_set():
+            try:
+                await callback.bot.send_chat_action(chat_id=callback.message.chat.id, action="typing")
+            except Exception as e:
+                logging.debug(f"chat_action error: {e}")
+            await asyncio.sleep(4)
+
+    typing_task = asyncio.create_task(periodic_typing())
+
+    status_message = callback.message
+    try:
+        await status_message.edit_text("♻️ Перегенерирую ответ...")
+    except Exception as e:
+        logging.debug(f"status reroll message error: {e}")
+
+    if llm_service.model:
+        try:
+            logging.info("LLM reroll: user_id=%s, char_id=%s", user_id, char_id)
+            model_response = await asyncio.wait_for(
+                llm_service.generate_response(messages_for_model),
+                timeout=180
+            )
+            final_answer = model_response or "Пустой ответ от модели."
+        except asyncio.TimeoutError:
+            logging.error("LLM reroll timeout")
+            final_answer = "Ответ не получен: время генерации вышло. Попробуйте позже."
+        except Exception as e:
+            logging.exception("LLM reroll error")
+            final_answer = f"Ошибка генерации: {e}"
+    else:
+        final_answer = (
+            "Локальная модель не загружена. Проверьте зависимости и путь к файлу GGUF "
+            "(models/mythomax-l2-13b.Q4_K_M.gguf)."
+        )
+
+    typing_stop.set()
+    with contextlib.suppress(asyncio.CancelledError):
+        typing_task.cancel()
+        await typing_task
+
+    c.execute("SELECT id FROM messages WHERE user_id = ? AND role = 'assistant' ORDER BY timestamp DESC LIMIT 1", (user_id,))
+    assistant_row = c.fetchone()
+    if assistant_row:
+        c.execute(
+            "UPDATE messages SET content = ?, timestamp = CURRENT_TIMESTAMP WHERE id = ?",
+            (final_answer, assistant_row[0])
+        )
+    else:
+        c.execute(
+            "INSERT INTO messages (user_id, role, content) VALUES (?, ?, ?)",
+            (user_id, 'assistant', final_answer)
+        )
+    conn.commit()
+    conn.close()
+
+    keyboard = get_response_keyboard()
+    try:
+        await status_message.edit_text(final_answer, reply_markup=keyboard)
+    except Exception as e:
+        logging.debug(f"reroll edit error: {e}")
+        await callback.message.answer(final_answer, reply_markup=keyboard)
+
 # Простой эхо-бот для начала
 @dp.message(F.text)
 async def echo_message(message: types.Message):
@@ -389,16 +541,12 @@ async def echo_message(message: types.Message):
         character_prompt = row[0]
 
     # Подтягиваем историю и отправляем в модель
-    history = await llm_service.get_chat_history(user_id, limit=10)
-    messages_for_model = []
-    if character_prompt:
-        messages_for_model.append({"role": "system", "content": character_prompt})
-    if user_gender == "male":
-        messages_for_model.append({"role": "system", "content": "Обращайся к пользователю в мужском роде и как к мужчине."})
-    elif user_gender == "female":
-        messages_for_model.append({"role": "system", "content": "Обращайся к пользователю в женском роде и как к девушке/женщине."})
-    messages_for_model.extend(history)
-    messages_for_model.append({"role": "user", "content": message.text})
+    messages_for_model = await assemble_messages(
+        user_id=user_id,
+        character_prompt=character_prompt,
+        user_gender=user_gender,
+        new_user_text=message.text
+    )
 
     status_message = None
     typing_stop = asyncio.Event()
@@ -456,14 +604,15 @@ async def echo_message(message: types.Message):
     
     conn.close()
 
+    keyboard = get_response_keyboard()
     if status_message:
         try:
-            await status_message.edit_text(final_answer)
+            await status_message.edit_text(final_answer, reply_markup=keyboard)
             return
         except Exception as e:
             logging.debug(f"edit status message error: {e}")
 
-    await message.answer(final_answer)
+    await message.answer(final_answer, reply_markup=keyboard)
 
 async def main():
     """Запуск бота"""
