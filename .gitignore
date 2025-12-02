@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.env
+venv*/
+env*/
+.venv*/
+*.sqlite3
+*.db
+
+# Large model files
+models/*.gguf
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
